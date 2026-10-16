@@ -2,11 +2,18 @@ name: Kitab OCR (Gemini)
 
 # ব্যবহার: এই ফাইলটি রাখুন  .github/workflows/kitab-ocr.yml
 # Secret: Settings → Secrets and variables → Actions → New repository secret → নাম: GEMINI_API_KEY
+# Settings → Actions → General → Workflow permissions → Read and write permissions
+#
 # রিপোর গঠন:
 #   prompt.txt          (মেইন রিপোতে, প্রম্পট)
 #   pages/              (কিতাবের ইমেজ: 0001.jpg, 0002.jpg ...)
 #   texts/              (আউটপুট txt এখানে তৈরি হবে)
-#   ocr_progress.json   (অগ্রগতি ট্র্যাক করবে)
+#   ocr_progress.json   (অগ্রগতি + দৈনিক রিকুয়েস্ট কাউন্ট)
+#
+# লিমিট সুরক্ষা (Gemini 3.5 Flash Lite: 15 RPM / 250K TPM / 500 RPD):
+#   - RPM : ডিফল্ট ৫ (যেকোনো ৬২ সেকেন্ডে সর্বোচ্চ ৫টি HTTP কল, রিট্রাই সহ) + প্রতি কলের মাঝে ন্যূনতম ১২ সেকেন্ড গ্যাপ
+#   - TPM : ব্যবহৃত টোকেন ট্র্যাক করে, ২,০০,০০০ এর নিচে রাখে
+#   - RPD : ডিফল্ট ৪৮০ এ থামে (Pacific সময়ের তারিখ অনুযায়ী কাউন্ট), 429 "PerDay" পেলেও সাথে সাথে থামে
 
 on:
   workflow_dispatch:
@@ -23,6 +30,12 @@ on:
       model:
         description: "Gemini মডেল"
         default: "gemini-3.5-flash-lite"
+      rpm:
+        description: "প্রতি মিনিটে সর্বোচ্চ রিকুয়েস্ট (সর্বোচ্চ 15)"
+        default: "5"
+      rpd_limit:
+        description: "দৈনিক সর্বোচ্চ রিকুয়েস্ট (সীমা 500, নিরাপদ মান 480)"
+        default: "480"
       max_images:
         description: "এই রানে সর্বোচ্চ কয়টি ইমেজ (0 = সব)"
         default: "0"
@@ -31,7 +44,7 @@ permissions:
   contents: write   # টেক্সট ও json পুশ করার জন্য
   actions: write    # সময় শেষ হলে নিজেকে আবার চালু করার জন্য
 
-# একসাথে দুইটা রান যেন না চলে
+# একসাথে দুইটা রান যেন না চলে (না হলে লিমিট দ্বিগুণ খরচ হবে)
 concurrency:
   group: kitab-ocr
   cancel-in-progress: false
@@ -46,6 +59,8 @@ jobs:
       OUTPUT_DIR: ${{ inputs.output_dir || 'texts' }}
       PROMPT_FILE: ${{ inputs.prompt_file || 'prompt.txt' }}
       MODEL: ${{ inputs.model || 'gemini-3.5-flash-lite' }}
+      RPM: ${{ inputs.rpm || '5' }}
+      RPD_LIMIT: ${{ inputs.rpd_limit || '480' }}
       MAX_IMAGES: ${{ inputs.max_images || '0' }}
       PROGRESS_FILE: ocr_progress.json
       GH_TOKEN: ${{ github.token }}
@@ -69,7 +84,9 @@ jobs:
         run: |
           python3 - <<'PY'
           import os, re, sys, json, time, base64, subprocess
-          from datetime import datetime, timezone
+          from collections import deque
+          from datetime import datetime, timezone, timedelta
+          from zoneinfo import ZoneInfo
           import requests
 
           # ---------- কনফিগ ----------
@@ -81,14 +98,25 @@ jobs:
           MAX_IMAGES    = int(os.environ.get("MAX_IMAGES", "0") or 0)
           PROGRESS_FILE = os.environ["PROGRESS_FILE"]
 
-          MAX_RETRIES   = 6          # প্রতি ইমেজে সর্বোচ্চ চেষ্টা
-          TIME_BUDGET   = 5 * 3600 + 35 * 60   # ৫ঘ ৩৫মি পর নতুন ইমেজ শুরু করবে না
+          RPM           = max(1, min(15, int(os.environ.get("RPM", "5") or 5)))
+          RPD_LIMIT     = max(1, min(500, int(os.environ.get("RPD_LIMIT", "480") or 480)))
+          TPM_SAFE      = 200_000          # ২৫০K সীমার নিচে নিরাপদ মান
+          WINDOW        = 62.0             # ৬০ সেকেন্ডের বদলে ২ সেকেন্ড বেশি, নিরাপত্তার জন্য
+          MIN_GAP       = 60.0 / RPM       # দুই কলের মাঝে ন্যূনতম বিরতি (RPM=5 → 12s)
+
+          MAX_RETRIES   = 6
+          TIME_BUDGET   = 5 * 3600 + 35 * 60
           START         = time.time()
+          PT            = ZoneInfo("America/Los_Angeles")
+          BD            = ZoneInfo("Asia/Dhaka")
           EXTS          = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                            ".png": "image/png", ".webp": "image/webp"}
 
           GEMINI_URL = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                         f"{MODEL}:streamGenerateContent?alt=sse&key={API_KEY}")
+
+          class DailyLimit(Exception):
+              pass
 
           def log(*a):
               print(*a, flush=True)
@@ -104,6 +132,14 @@ jobs:
 
           def natural_key(s):
               return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+          def pt_date():
+              return datetime.now(PT).strftime("%Y-%m-%d")
+
+          def reset_time_bd():
+              n = datetime.now(PT)
+              nxt = (n + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+              return nxt.astimezone(BD).strftime("%Y-%m-%d %I:%M %p (বাংলাদেশ সময়)")
 
           # ---------- প্রি-চেক ----------
           if not API_KEY:
@@ -147,22 +183,71 @@ jobs:
           progress = load_progress()
           completed = list(progress.get("completed", []))
           failed = dict(progress.get("failed", {}))
+          last_completed = progress.get("last_completed")
+          usage = progress.get("usage", {})
+          if usage.get("date") != pt_date():
+              usage = {"date": pt_date(), "requests": 0}
 
           def save_progress(last=None):
+              global last_completed
+              if last:
+                  last_completed = last
               done_set = set(completed)
-              progress_obj = {
+              obj = {
                   "model": MODEL,
                   "total_images": total,
                   "completed_count": len(completed),
-                  "last_completed": last if last else progress.get("last_completed"),
+                  "last_completed": last_completed,
                   "next_pending": next((i for i in images if i not in done_set), None),
+                  "usage": usage,
                   "completed": completed,
                   "failed": failed,
                   "updated_at": datetime.now(timezone.utc).isoformat(),
               }
-              progress["last_completed"] = progress_obj["last_completed"]
               with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-                  json.dump(progress_obj, f, ensure_ascii=False, indent=2)
+                  json.dump(obj, f, ensure_ascii=False, indent=2)
+
+          # ---------- রেট-লিমিট নিয়ন্ত্রণ ----------
+          req_times = deque()      # প্রতিটি HTTP কলের সময় (রিট্রাই সহ)
+          tok_events = deque()     # (সময়, টোকেন)
+          state = {"last_req": 0.0, "last_tokens": 8000}
+
+          def throttle():
+              """কল করার আগে RPM / TPM / RPD তিনটাই নিশ্চিত করে।"""
+              # দিন বদলালে (Pacific) দৈনিক কাউন্ট রিসেট
+              global usage
+              if usage.get("date") != pt_date():
+                  usage = {"date": pt_date(), "requests": 0}
+              if usage["requests"] >= RPD_LIMIT:
+                  raise DailyLimit(f"দৈনিক সীমা ({RPD_LIMIT}) পূর্ণ")
+              while True:
+                  now = time.time()
+                  while req_times and now - req_times[0] >= WINDOW:
+                      req_times.popleft()
+                  while tok_events and now - tok_events[0][0] >= WINDOW:
+                      tok_events.popleft()
+                  wait = 0.0
+                  # ন্যূনতম গ্যাপ
+                  wait = max(wait, MIN_GAP - (now - state["last_req"]))
+                  # স্লাইডিং উইন্ডো RPM
+                  if len(req_times) >= RPM:
+                      wait = max(wait, WINDOW - (now - req_times[0]))
+                  # TPM
+                  used = sum(t for _, t in tok_events)
+                  if tok_events and used + state["last_tokens"] > TPM_SAFE:
+                      wait = max(wait, WINDOW - (now - tok_events[0][0]))
+                  if wait <= 0:
+                      break
+                  log(f"   ⏳ লিমিট সুরক্ষা: {wait:.0f}s অপেক্ষা (RPM={len(req_times)}/{RPM}, TPM≈{used})")
+                  time.sleep(wait + 0.3)
+              t = time.time()
+              req_times.append(t)
+              state["last_req"] = t
+              usage["requests"] += 1
+
+          def parse_retry_delay(body):
+              m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', body)
+              return float(m.group(1)) if m else None
 
           # ---------- Gemini কল (streaming SSE) ----------
           def ocr_image(path):
@@ -181,19 +266,30 @@ jobs:
               }
               last_err = None
               for attempt in range(1, MAX_RETRIES + 1):
+                  throttle()   # রিট্রাইও লিমিটের মধ্যে গোনা হয়
                   try:
                       r = requests.post(GEMINI_URL, json=body, stream=True, timeout=(30, 300))
                       if r.status_code != 200:
-                          last_err = f"HTTP {r.status_code}: {r.text[:300]}"
-                          if r.status_code in (429, 500, 502, 503, 504):
+                          txt = r.text
+                          last_err = f"HTTP {r.status_code}: {txt[:300]}"
+                          if r.status_code == 429:
+                              low = txt.lower()
+                              if "perday" in low or "per day" in low or "daily" in low:
+                                  raise DailyLimit("Gemini দৈনিক কোটা শেষ (429 PerDay)")
+                              delay = parse_retry_delay(txt)
+                              wait = max(65.0, (delay or 0) + 5)
+                              log(f"   ⚠ 429 (মিনিট/টোকেন সীমা) — {wait:.0f}s অপেক্ষা")
+                              time.sleep(wait)
+                              continue
+                          if r.status_code in (500, 502, 503, 504):
                               wait = min(120, 10 * attempt * attempt)
-                              log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err} — {wait}s অপেক্ষা")
+                              log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err[:150]} — {wait}s অপেক্ষা")
                               time.sleep(wait)
                               continue
                           raise RuntimeError(last_err)
 
                       r.encoding = "utf-8"  # SSE তে charset না থাকলে requests ISO-8859-1 ধরে, তাই UTF-8 জোর করে দেওয়া হলো
-                      chunks, finish = [], None
+                      chunks, finish, tokens = [], None, None
                       for raw in r.iter_lines(decode_unicode=True):
                           if not raw or not raw.startswith("data:"):
                               continue
@@ -210,8 +306,15 @@ jobs:
                                       chunks.append(p["text"])
                               if cand.get("finishReason"):
                                   finish = cand["finishReason"]
+                          um = j.get("usageMetadata")
+                          if um and um.get("totalTokenCount"):
+                              tokens = um["totalTokenCount"]
                           if j.get("promptFeedback", {}).get("blockReason"):
                               raise RuntimeError("Blocked: " + j["promptFeedback"]["blockReason"])
+
+                      if tokens:
+                          tok_events.append((time.time(), tokens))
+                          state["last_tokens"] = int(tokens * 1.2)
 
                       text = "".join(chunks).strip()
                       if not text:
@@ -220,6 +323,8 @@ jobs:
                           time.sleep(5 * attempt)
                           continue
                       return text, finish
+                  except DailyLimit:
+                      raise
                   except (requests.RequestException, RuntimeError) as e:
                       last_err = str(e)
                       log(f"   ↻ চেষ্টা {attempt}/{MAX_RETRIES} — {last_err[:300]}")
@@ -248,9 +353,11 @@ jobs:
           done_set = set(completed)
           pending = [i for i in images if i not in done_set]
           log(f"মোট: {total} | সম্পূর্ণ: {len(done_set)} | বাকি: {len(pending)}")
+          log(f"লিমিট সেটিং: RPM={RPM}, গ্যাপ≥{MIN_GAP:.0f}s, RPD={RPD_LIMIT} (আজ আগে ব্যবহার: {usage['requests']}), TPM<{TPM_SAFE}")
 
           processed = 0
           stopped_for_time = False
+          stopped_daily = False
           for name in pending:
               if MAX_IMAGES and processed >= MAX_IMAGES:
                   break
@@ -260,7 +367,7 @@ jobs:
                   break
 
               idx = images.index(name) + 1
-              log(f"[{idx}/{total}] {name} → প্রসেসিং...")
+              log(f"[{idx}/{total}] {name} → প্রসেসিং... (আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT})")
               out_name = os.path.splitext(name)[0] + ".txt"
               out_path = os.path.join(OUTPUT_DIR, out_name)
               try:
@@ -275,6 +382,16 @@ jobs:
                               f"OCR: {name} ({len(completed)}/{total})")
                   log(f"   ✔ সম্পন্ন ও পুশ হয়েছে ({len(text)} অক্ষর, finish={finish})")
                   processed += 1
+              except DailyLimit as e:
+                  stopped_daily = True
+                  log(f"🛑 {e}")
+                  log(f"   দৈনিক কোটা রিসেট: {reset_time_bd()} — এরপর আবার রান দিন।")
+                  save_progress()
+                  try:
+                      commit_push([PROGRESS_FILE], "OCR: daily limit reached")
+                  except Exception as ee:
+                      log(f"   progress পুশ ব্যর্থ: {ee}")
+                  break
               except Exception as e:
                   log(f"   ✘ ব্যর্থ: {name} — {e}")
                   failed[name] = {"error": str(e)[:300],
@@ -285,17 +402,15 @@ jobs:
                   except Exception as ee:
                       log(f"   progress পুশ ব্যর্থ: {ee}")
                   processed += 1
-              # রেট-লিমিট এড়াতে সামান্য বিরতি
-              time.sleep(2)
 
           # ---------- শেষ ----------
           done_set = set(completed)
           remaining = [i for i in images if i not in done_set]
           retriable = [i for i in remaining if i not in failed]
-          log(f"\nএই রানে প্রসেস: {processed} | মোট সম্পূর্ণ: {len(done_set)}/{total} | ব্যর্থ: {len(failed)}")
+          log(f"\nএই রানে প্রসেস: {processed} | মোট সম্পূর্ণ: {len(done_set)}/{total} | ব্যর্থ: {len(failed)} | আজকের রিকুয়েস্ট: {usage['requests']}/{RPD_LIMIT}")
 
-          # সময়ের কারণে বা max_images এর কারণে থামলে এবং কাজ বাকি থাকলে আবার চালু হবে
-          again = bool(stopped_for_time and retriable)
+          # শুধু সময় শেষ হলে নিজেকে আবার চালু করবে; দৈনিক লিমিটে থামলে করবে না
+          again = bool(stopped_for_time and retriable and not stopped_daily)
           set_output("remaining", "true" if again else "false")
           if failed:
               log("ব্যর্থ ফাইল: " + ", ".join(failed.keys()))
