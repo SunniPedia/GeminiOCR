@@ -192,6 +192,7 @@ jobs:
                               continue
                           raise RuntimeError(last_err)
 
+                      r.encoding = "utf-8"  # SSE তে charset না থাকলে requests ISO-8859-1 ধরে, তাই UTF-8 জোর করে দেওয়া হলো
                       chunks, finish = [], None
                       for raw in r.iter_lines(decode_unicode=True):
                           if not raw or not raw.startswith("data:"):
